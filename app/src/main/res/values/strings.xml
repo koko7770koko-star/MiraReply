@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">ミラ返信アシスト</string>
+    <string name="service_label">ミラ返信アシスト</string>
+    <string name="service_description">MiraiMindのチャット画面を読み取り、端末内のAIで返信候補を3つ作って画面に表示します。選んだ候補を入力欄に入れて送信します。会話内容は端末の外に送信されません。</string>
+</resources>

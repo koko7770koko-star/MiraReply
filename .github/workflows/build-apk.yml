@@ -1,0 +1,38 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14.3'
+      # 通常版（モデルなし・約20MB）
+      - name: Build APK (lite)
+        run: gradle :app:assembleDebug --stacktrace && cp app/build/outputs/apk/debug/app-debug.apk MiraReply-lite.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MiraReply-lite-apk
+          path: MiraReply-lite.apk
+      # Gemma 4 E2B 内蔵版（約2.5GB）
+      - name: Download Gemma model
+        run: |
+          mkdir -p app/src/main/assets/model
+          curl -sSL -o /tmp/gemma.litertlm "https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/main/gemma-4-E2B-it.litertlm?download=true"
+          test "$(stat -c %s /tmp/gemma.litertlm)" = "2588147712"
+          split -b 700M -d -a 2 /tmp/gemma.litertlm app/src/main/assets/model/gemma4.part
+          rm /tmp/gemma.litertlm
+      - name: Build APK (Gemma embedded)
+        run: gradle :app:assembleDebug --stacktrace && mv app/build/outputs/apk/debug/app-debug.apk MiraReply-gemma.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MiraReply-gemma-apk
+          path: MiraReply-gemma.apk
+          compression-level: 0
