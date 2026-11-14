@@ -513,7 +513,7 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
         DebugLog.d("送信: 方法${method}（${SEND_METHODS[method]}）実行=$ok 候補${cands.size}個" +
             (cands.firstOrNull()?.let { " 1番目=${it.viewIdResourceName ?: it.className} desc=${it.contentDescription}" } ?: ""))
         if (!ok) { clickSend(text, auto, attempt + 1); return }
-        checkSent(text, auto, method, attempt, check = 0)
+        checkSent(text, auto, method, attempt, check = if (method == 6) -1 else 0)
     }
 
     /** 送れたか確認。入力欄が空でも画面に出るまで少し待つ（二重送信を防ぐ） */
@@ -527,6 +527,7 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
                     onSent(auto)
                 }
                 st == "cleared" && check < 3 -> checkSent(text, auto, method, attempt, check + 1)
+                st == "same" && check < 0 -> checkSent(text, auto, method, attempt, check + 1) // 方法6は時間がかかる
                 else -> {
                     // 入力欄が変わってしまっていたら入れ直してから次の方法へ
                     if (st != "same") putText(text)
@@ -572,6 +573,25 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
                     val c = reader.findSendCandidates(r, reader.findInput(r))
                     if (!click(c.getOrNull(0))) tap(c.getOrNull(0))
                 }, 400)
+                true
+            }
+            6 -> { // 入力欄をタップしてキーボードを開き、そこへ文を入れてキーボードの「↵」で送る（MiraiMind方式）
+                val box = input ?: return false
+                if (!(box.performAction(AccessibilityNodeInfo.ACTION_CLICK) || reader.clickableParent(box)?.performAction(AccessibilityNodeInfo.ACTION_CLICK) == true)) tap(box)
+                main.postDelayed({
+                    val r = rootInActiveWindow ?: return@postDelayed
+                    val field = r.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)?.takeIf { it.isEditable } ?: reader.findInput(r)
+                    if (field == null) { DebugLog.d("方法6: キーボード後の入力欄が見つからない"); return@postDelayed }
+                    field.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, Bundle().apply {
+                        putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+                    })
+                    main.postDelayed({
+                        val r2 = rootInActiveWindow ?: return@postDelayed
+                        val f2 = r2.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)?.takeIf { it.isEditable } ?: field
+                        val ok = f2.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+                        DebugLog.d("方法6: ↵ 実行=$ok 入力欄=${f2.viewIdResourceName}")
+                    }, 350)
+                }, 800)
                 true
             }
             4 -> tap(cands.getOrNull(1))
@@ -731,7 +751,7 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
         private const val SETTLE_MS = 1500L
         private const val STABLE_MS = 1200L
         private const val HIDE_DELAY_MS = 2000L
-        private val SEND_METHODS = listOf("ボタンを押す", "ボタン位置をタップ", "キーボードの送信", "貼り付けで入れ直して押す", "2番目の候補をタップ", "2番目の候補を押す")
+        private val SEND_METHODS = listOf("ボタンを押す", "ボタン位置をタップ", "キーボードの送信", "貼り付けで入れ直して押す", "2番目の候補をタップ", "2番目の候補を押す", "入力欄を開いてキーボードの↵")
         private const val MAX_AUTO_RETRY = 3
         private const val AUTO_RETRY_SEC = 8
         private const val SUMMARY_BATCH = 40
