@@ -192,6 +192,12 @@ class MainActivity : Activity() {
         ignoreEt = field(col, "読み取りで無視する文字（1行に1つ。ボタン名などが拾われる時）", prefs.ignoreTexts, multi = true)
         col.addView(note("チャット画面で丸い「返」ボタン →「画面構造」を押すと画面の構造が保存されます。下のボタンで共有して中身を見ると、正しいIDがわかります。"))
         col.addView(button("保存した画面構造を共有") { shareDump() })
+        col.addView(button("動作ログを共有（自動会話の不具合調査用）") {
+            val text = DebugLog.saved(this).ifBlank { "ログはまだありません" }
+            startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"; putExtra(Intent.EXTRA_TEXT, text.takeLast(90_000))
+            }, "動作ログを共有"))
+        })
 
         col.addView(button("設定を保存") { save() })
     }

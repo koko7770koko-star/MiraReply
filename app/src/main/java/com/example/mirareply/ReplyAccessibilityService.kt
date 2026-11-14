@@ -167,9 +167,18 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
 
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
             val active = rootInActiveWindow?.packageName?.toString()
-            if (active == prefs.targetPackage) showOverlay() else if (active != null && active != packageName && !isSystemUi(active)) hideOverlay()
+            if (active == prefs.targetPackage) showOverlay()
+            else if (active != null && active != packageName && !isSystemUi(active)) {
+                // 一瞬だけ他のウィンドウが前に出ることがある（ゲームスペース・フローティング等）ので、少し待ってから消す
+                if (overlayShown) {
+                    DebugLog.d("他の画面が前面: $active（2秒後に確認）")
+                    main.removeCallbacks(hideRunnable)
+                    main.postDelayed(hideRunnable, HIDE_DELAY_MS)
+                }
+            }
         }
         if (pkg != prefs.targetPackage) return
+        main.removeCallbacks(hideRunnable)
         showOverlay()
         // キャラの返信は少しずつ表示されることがあるので、変化が落ち着いてから読む
         main.removeCallbacks(scanRunnable)
@@ -189,9 +198,14 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
         }
     }
 
+    private val hideRunnable = Runnable {
+        val active = rootInActiveWindow?.packageName?.toString()
+        if (active != prefs.targetPackage) hideOverlay()
+    }
+
+    /** オーバーレイを隠す。自動送信の待ちは消さない（戻ってきたら続きから送る） */
     private fun hideOverlay() {
-        if (overlayShown) { overlay.hide(); overlayShown = false }
-        cancelCountdown()
+        if (overlayShown) { overlay.hide(); overlayShown = false; DebugLog.d("オーバーレイを隠した") }
     }
 
     private fun readScreen(): ChatScreen? {
@@ -229,6 +243,7 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
         }
         nudgesInRow = 0
         main.removeCallbacks(idleRunnable)
+        DebugLog.d("新着: 「${key.take(20)}」 自動=${prefs.autoSend}")
         generate(key, buildRequest(screen))
     }
 
@@ -281,7 +296,8 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
                 val start = System.currentTimeMillis()
                 val (list, used) = withContext(genDispatcher) { runEngine(req) }
                 val sec = (System.currentTimeMillis() - start) / 100 / 10.0
-                if (genSeq != my) return@launch
+                if (genSeq != my) { DebugLog.d("生成結果を破棄（新しい生成あり）"); return@launch }
+                DebugLog.d("候補${list.size}件（$used） 自動=${prefs.autoSend}")
                 candidates = list
                 lastHandledKey = key
                 overlay.setCandidates(list)
@@ -300,6 +316,7 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
             } catch (t: Throwable) {
                 if (genSeq != my) return@launch
                 Log.e(TAG, "generate failed", t)
+                DebugLog.d("生成エラー: ${t.message}")
                 overlay.setStatus(t.message ?: "生成エラー")
                 onAutoError()
             } finally {
@@ -352,9 +369,10 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
         var remain = if (max > min) Random.nextInt(min, max + 1) else min
         val pick = if (prefs.autoPickRandom && candidates.size > 1) Random.nextInt(candidates.size) else 0
         overlay.setCountdownVisible(true)
+        DebugLog.d("カウントダウン開始 ${remain}秒 候補${pick + 1}")
         val r = object : Runnable {
             override fun run() {
-                if (!prefs.autoSend) { cancelCountdown(); return }
+                if (!prefs.autoSend) { DebugLog.d("カウントダウン中に自動会話オフ"); cancelCountdown(); return }
                 if (remain <= 0) {
                     overlay.setCountdownVisible(false)
                     countdown = null
@@ -370,19 +388,47 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
         main.post(r)
     }
 
+    private var regenInTurn = 0
+    private var waitFront = 0
+
     private fun autoSendNow(key: String, pick: Int) {
-        // 待っている間にキャラが続けて話していたら、その内容で作り直す
         val screen = readScreen()
-        val nowKey = screen?.messages?.lastOrNull { !it.fromUser }?.text
-        if (key.startsWith(NUDGE_KEY)) {
-            if (screen != null && screen.messages.lastOrNull()?.fromUser == false) { lastHandledKey = null; scan(force = false); return }
-        } else if (screen != null && nowKey != null && nowKey != key) {
+        if (screen == null) {
+            // MiraiMind が前面に無い → 戻るまで3秒ごとに待つ（最大10分）
+            if (waitFront++ < 200 && prefs.autoSend) {
+                overlay.setStatus("MiraiMindのチャット画面に戻ると自動送信します")
+                val r = Runnable { countdown = null; autoSendNow(key, pick) }
+                countdown = r
+                main.postDelayed(r, 3000)
+            }
+            DebugLog.d("自動送信: MiraiMindが前面に無いので待機($waitFront)")
+            return
+        }
+        waitFront = 0
+        // 待っている間にキャラが続けて話していたら、その内容で作り直す（1ターン2回まで）
+        if (hasNewCharMessage(screen, key) && regenInTurn < 2) {
+            regenInTurn++
+            DebugLog.d("自動送信: キャラの新しい発言があるので作り直し($regenInTurn)")
             lastHandledKey = null
+            seenKey = null
             scan(force = false)
             return
         }
-        val text = candidates.getOrNull(pick) ?: candidates.firstOrNull() ?: return
+        val text = candidates.getOrNull(pick) ?: candidates.firstOrNull()
+        if (text == null) { DebugLog.d("自動送信: 候補が空"); return }
+        regenInTurn = 0
+        DebugLog.d("自動送信: 候補${pick + 1}を送信 「${text.take(20)}」")
         sendText(text, auto = true)
+    }
+
+    /** key（候補を作った時のキャラの発言）より後に、キャラの新しい発言があるか */
+    private fun hasNewCharMessage(screen: ChatScreen, key: String): Boolean {
+        val msgs = screen.messages
+        if (key.startsWith(NUDGE_KEY)) return msgs.lastOrNull()?.fromUser == false
+        val k = CharStore.norm(key)
+        val idx = msgs.indexOfLast { !it.fromUser && CharStore.norm(it.text).let { t -> t == k || t.startsWith(k) || k.startsWith(t) } }
+        if (idx < 0) return false // 見つからない（スクロール等）→ そのまま送る
+        return msgs.drop(idx + 1).any { !it.fromUser }
     }
 
     private fun onAutoError() {
@@ -397,6 +443,7 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
     }
 
     private fun stopAuto(msg: String) {
+        DebugLog.d("自動会話停止: $msg")
         prefs.autoSend = false
         cancelCountdown()
         main.removeCallbacks(idleRunnable)
@@ -438,48 +485,120 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
         while (appSent.size > 300) appSent.remove(appSent.first())
         if (!putText(text)) { if (auto) stopAuto("入力できないので自動会話を止めました"); return }
         // 文字が入ると送信ボタンが出るアプリが多いので少し待ってから押す
-        main.postDelayed({ clickSend(text, auto, attempt = 1) }, 400)
+        main.postDelayed({ clickSend(text, auto, attempt = 0) }, 400)
     }
 
+    /**
+     * 送信ボタンを押す。アプリによって効く押し方が違うので、順番に試して
+     * 入力欄が空になったら成功とみなす。成功した方法は覚えて次から最初に使う。
+     */
     private fun clickSend(text: String, auto: Boolean, attempt: Int) {
-        val r2 = rootInActiveWindow ?: return
-        val btn = reader.findSendButton(r2, reader.findInput(r2))
-        if (btn == null || !btn.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+        val order = SEND_METHODS.indices.sortedBy { if (it == prefs.sendMethod) -1 else it }
+        if (attempt >= order.size) {
+            DebugLog.d("送信: すべての方法で失敗")
             overlay.setStatus("入力欄に入れました。送信ボタンを押してください")
-            if (auto) stopAuto("送信ボタンが押せないので自動会話を止めました")
+            if (auto) stopAuto("送信ボタンが押せないので自動会話を止めました（設定の「動作ログを共有」で原因を送ってください）")
             return
         }
-        // 本当に送れたか確認（入力欄が空になっている or 最後の発言が自分）
+        val method = order[attempt]
+        val root = rootInActiveWindow
+        if (root == null || root.packageName?.toString() != prefs.targetPackage) {
+            DebugLog.d("送信: MiraiMindが前面に無い"); return
+        }
+        val input = reader.findInput(root)
+        val cands = reader.findSendCandidates(root, input)
+        val ok = try { trySend(method, root, input, cands, text) } catch (t: Throwable) { DebugLog.d("送信方法${method}で例外: ${t.message}"); false }
+        DebugLog.d("送信: 方法${method}（${SEND_METHODS[method]}）実行=$ok 候補${cands.size}個" +
+            (cands.firstOrNull()?.let { " 1番目=${it.viewIdResourceName ?: it.className} desc=${it.contentDescription}" } ?: ""))
+        if (!ok) { clickSend(text, auto, attempt + 1); return }
         main.postDelayed({
-            val root = rootInActiveWindow
-            val inputText = root?.let { reader.findInput(it)?.text?.toString() }.orEmpty()
-            val sent = inputText.isBlank() || inputText != text
-            if (!sent && attempt < 2) { clickSend(text, auto, attempt + 1); return@postDelayed }
-            if (!sent) {
-                overlay.setStatus("送信を確認できませんでした")
-                if (auto) stopAuto("送信できないので自動会話を止めました")
-                return@postDelayed
-            }
-            candidates = emptyList()
-            overlay.setCandidates(emptyList())
-            overlay.setPanelVisible(false)
-            if (auto) {
-                autoTurns++
-                applyAutoUi()
-                val max = prefs.autoMaxTurns
-                if (max in 1..autoTurns) {
-                    stopAuto("自動会話 $autoTurns 回送ったので止めました")
-                } else {
-                    overlay.setStatus("送信しました（自動 $autoTurns 回目）。返事待ち…")
-                    if (prefs.nudgeMin > 0) {
-                        main.removeCallbacks(idleRunnable)
-                        main.postDelayed(idleRunnable, prefs.nudgeMin * 60_000L)
-                    }
-                }
+            if (isSent(text)) {
+                if (prefs.sendMethod != method) { prefs.sendMethod = method; DebugLog.d("送信方法${method}を記憶") }
+                onSent(auto)
             } else {
-                overlay.setStatus("送信しました")
+                // 文字が消えてしまっていたら入れ直してから次の方法へ
+                val cur = rootInActiveWindow?.let { reader.findInput(it)?.text?.toString() }.orEmpty()
+                if (cur.isBlank()) putText(text)
+                clickSend(text, auto, attempt + 1)
             }
-        }, 1200)
+        }, 900)
+    }
+
+    private fun trySend(method: Int, root: AccessibilityNodeInfo, input: AccessibilityNodeInfo?, cands: List<AccessibilityNodeInfo>, text: String): Boolean {
+        fun tap(n: AccessibilityNodeInfo?): Boolean {
+            n ?: return false
+            val r = android.graphics.Rect(); n.getBoundsInScreen(r)
+            if (r.isEmpty) return false
+            val path = android.graphics.Path().apply { moveTo(r.exactCenterX(), r.exactCenterY()) }
+            val g = android.accessibilityservice.GestureDescription.Builder()
+                .addStroke(android.accessibilityservice.GestureDescription.StrokeDescription(path, 0, 60)).build()
+            return dispatchGesture(g, null, null)
+        }
+        fun click(n: AccessibilityNodeInfo?) = n?.let { reader.clickableParent(it) }?.performAction(AccessibilityNodeInfo.ACTION_CLICK) == true
+        return when (method) {
+            0 -> click(cands.getOrNull(0))
+            1 -> tap(cands.getOrNull(0))
+            2 -> input?.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id) == true
+            3 -> { // 貼り付けで入れ直す（アプリが文字入力を認識していない場合）
+                if (input == null) return false
+                val cm = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                cm.setPrimaryClip(android.content.ClipData.newPlainText("reply", text))
+                input.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, Bundle().apply {
+                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "")
+                })
+                input.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                input.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+                input.refresh()
+                if (CharStore.norm(input.text?.toString().orEmpty()) != CharStore.norm(text)) {
+                    // 貼り付けできなかった → 元に戻して次の方法へ
+                    putText(text)
+                    return false
+                }
+                // 送信ボタンが現れるのを待ってから押す
+                main.postDelayed({
+                    val r = rootInActiveWindow ?: return@postDelayed
+                    val c = reader.findSendCandidates(r, reader.findInput(r))
+                    if (!click(c.getOrNull(0))) tap(c.getOrNull(0))
+                }, 400)
+                true
+            }
+            4 -> tap(cands.getOrNull(1))
+            5 -> click(cands.getOrNull(1))
+            else -> false
+        }
+    }
+
+    /** 送れたか（入力欄から文が消えた／最後の発言が自分のその文） */
+    private fun isSent(text: String): Boolean {
+        val root = rootInActiveWindow ?: return false
+        val inputText = reader.findInput(root)?.text?.toString().orEmpty()
+        if (CharStore.norm(inputText) != CharStore.norm(text)) return true
+        val screen = readScreen() ?: return false
+        val last = screen.messages.lastOrNull() ?: return false
+        return last.fromUser && CharStore.norm(last.text) == CharStore.norm(text) && inputText.isBlank()
+    }
+
+    private fun onSent(auto: Boolean) {
+        DebugLog.d("送信成功")
+        candidates = emptyList()
+        overlay.setCandidates(emptyList())
+        overlay.setPanelVisible(false)
+        if (auto) {
+            autoTurns++
+            applyAutoUi()
+            val max = prefs.autoMaxTurns
+            if (max in 1..autoTurns) {
+                stopAuto("自動会話 $autoTurns 回送ったので止めました")
+            } else {
+                overlay.setStatus("送信しました（自動 $autoTurns 回目）。返事待ち…")
+                if (prefs.nudgeMin > 0) {
+                    main.removeCallbacks(idleRunnable)
+                    main.postDelayed(idleRunnable, prefs.nudgeMin * 60_000L)
+                }
+            }
+        } else {
+            overlay.setStatus("送信しました")
+        }
     }
 
     // ---------- OverlayPanel.Listener ----------
@@ -546,6 +665,7 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
     }
 
     override fun onCancelAutoSend() {
+        DebugLog.d("停止ボタン")
         cancelCountdown()
         overlay.setStatus("今回の自動送信を止めました。候補をタップで送信")
     }
@@ -560,6 +680,8 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
             screen.messages.forEach {
                 appendLine((if (it.fromUser) "[自分] " else "[キャラ] ") + it.text.replace("\n", " "))
             }
+            appendLine("--- 動作ログ ---")
+            appendLine(DebugLog.text().lines().takeLast(80).joinToString("\n"))
             appendLine("--- 画面構造 ---")
             append(ChatReader.dump(root))
         }
@@ -587,6 +709,8 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
         private const val TAG = "ReplyService"
         private const val SETTLE_MS = 1500L
         private const val STABLE_MS = 1200L
+        private const val HIDE_DELAY_MS = 2000L
+        private val SEND_METHODS = listOf("ボタンを押す", "ボタン位置をタップ", "キーボードの送信", "貼り付けで入れ直して押す", "2番目の候補をタップ", "2番目の候補を押す")
         private const val MAX_AUTO_RETRY = 3
         private const val AUTO_RETRY_SEC = 8
         private const val SUMMARY_BATCH = 40

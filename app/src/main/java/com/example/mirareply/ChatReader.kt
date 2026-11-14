@@ -144,30 +144,58 @@ class ChatReader(private val prefs: Prefs) {
     }
 
     /** 送信ボタンを探す（ID指定 → 文字/説明に「送信」 → 入力欄の右側のクリック可能な要素） */
-    fun findSendButton(root: AccessibilityNodeInfo, input: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
-        if (prefs.sendButtonId.isNotBlank()) {
-            root.findAccessibilityNodeInfosByViewId(prefs.sendButtonId).firstOrNull()?.let { return clickableSelfOrParent(it) }
-        }
-        val words = listOf("送信", "send", "Send", "SEND")
-        findFirst(root) { n ->
-            n.isVisibleToUser && (n.isClickable || n.parent?.isClickable == true) &&
-                words.any { w -> n.contentDescription?.contains(w) == true || n.text?.toString() == w }
-        }?.let { return clickableSelfOrParent(it) }
+    fun findSendButton(root: AccessibilityNodeInfo, input: AccessibilityNodeInfo?): AccessibilityNodeInfo? =
+        findSendCandidates(root, input).firstOrNull()
 
-        if (input == null) return null
-        val inRect = Rect(); input.getBoundsInScreen(inRect)
-        var best: AccessibilityNodeInfo? = null
-        var bestDist = Int.MAX_VALUE
-        walk(root) { n ->
-            if (!n.isClickable || !n.isVisibleToUser || n.isEditable) return@walk
+    /**
+     * 送信ボタンらしいものを、可能性の高い順に返す。
+     * 押せる（clickable）でなくても候補に入れる（タップ操作で押すため）。
+     */
+    fun findSendCandidates(root: AccessibilityNodeInfo, input: AccessibilityNodeInfo?): List<AccessibilityNodeInfo> {
+        val out = ArrayList<AccessibilityNodeInfo>()
+        fun add(n: AccessibilityNodeInfo?) {
+            if (n == null) return
             val r = Rect(); n.getBoundsInScreen(r)
-            val sameRow = r.centerY() in (inRect.top - 30)..(inRect.bottom + 30)
-            if (sameRow && r.left >= inRect.right - 10) {
-                val d = r.left - inRect.right
-                if (d < bestDist) { bestDist = d; best = n }
-            }
+            if (r.isEmpty) return
+            if (out.none { o -> Rect().also { o.getBoundsInScreen(it) } == r }) out.add(n)
         }
-        return best
+        if (prefs.sendButtonId.isNotBlank()) {
+            root.findAccessibilityNodeInfosByViewId(prefs.sendButtonId).forEach { add(it) }
+        }
+        val words = listOf("送信", "send", "Send", "SEND", "発送", "送る")
+        walk(root) { n ->
+            if (!n.isVisibleToUser || n.isEditable) return@walk
+            val id = n.viewIdResourceName?.lowercase().orEmpty()
+            val desc = n.contentDescription?.toString().orEmpty()
+            val txt = n.text?.toString().orEmpty()
+            if (id.contains("send") || words.any { w -> desc.contains(w) || txt == w }) add(n)
+        }
+        if (input != null) {
+            val inRect = Rect(); input.getBoundsInScreen(inRect)
+            // 入力欄と同じ行で、入力欄の右側（または右端寄り）にある小さめの部品
+            val row = ArrayList<Pair<Int, AccessibilityNodeInfo>>()
+            walk(root) { n ->
+                if (!n.isVisibleToUser || n.isEditable) return@walk
+                val r = Rect(); n.getBoundsInScreen(r)
+                if (r.isEmpty || r.width() > inRect.width() / 2 || r.height() > inRect.height() * 3) return@walk
+                val sameRow = r.centerY() in (inRect.top - 40)..(inRect.bottom + 40)
+                if (sameRow && r.centerX() > inRect.centerX() + inRect.width() / 4) {
+                    row.add((kotlin.math.abs(r.left - inRect.right) - if (n.isClickable) 50 else 0) to n)
+                }
+            }
+            row.sortedBy { it.first }.forEach { add(it.second) }
+        }
+        return out
+    }
+
+    fun clickableParent(n: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        var cur: AccessibilityNodeInfo? = n
+        var i = 0
+        while (cur != null && i < 5) {
+            if (cur.isClickable) return cur
+            cur = cur.parent; i++
+        }
+        return null
     }
 
     private fun clickableSelfOrParent(n: AccessibilityNodeInfo): AccessibilityNodeInfo {

@@ -154,6 +154,11 @@ class Prefs(context: Context) {
         return f.exists() && f.length() >= model.sizeBytes * 0.98
     }
 
+    /** うまく送れた送信方法（次から最初に試す） */
+    var sendMethod: Int
+        get() = sp.getInt("sendMethod", 0)
+        set(v) = sp.edit().putInt("sendMethod", v).apply()
+
     // ---------- 読み取りの手動指定 ----------
 
     /** 自動判定がうまくいかない時に手動指定する View ID（例: com.immomo.miraimind:id/et_input） */
