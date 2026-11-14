@@ -526,7 +526,12 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
                     if (prefs.sendMethod != method) { prefs.sendMethod = method; DebugLog.d("送信方法${method}を記憶") }
                     onSent(auto)
                 }
-                st == "cleared" && check < 3 -> checkSent(text, auto, method, attempt, check + 1)
+                // ↵のあと入力欄が空のまま → 送れている（MiraiMindは自分の発言がすぐ画面に出ないことがある）
+                st == "cleared" && check >= 1 -> {
+                    if (prefs.sendMethod != method) { prefs.sendMethod = method; DebugLog.d("送信方法${method}を記憶") }
+                    onSent(auto)
+                }
+                st == "cleared" -> checkSent(text, auto, method, attempt, check + 1)
                 st == "same" && check < 0 -> checkSent(text, auto, method, attempt, check + 1) // 方法6は時間がかかる
                 else -> {
                     // 入力欄が変わってしまっていたら入れ直してから次の方法へ

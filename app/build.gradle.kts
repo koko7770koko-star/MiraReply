@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.mirareply"
         minSdk = 31          // Android 12 以上
         targetSdk = 36
-        versionCode = 8
-        versionName = "1.3.4"
+        versionCode = 9
+        versionName = "1.3.5"
         ndk { abiFilters += listOf("arm64-v8a") }
     }
 

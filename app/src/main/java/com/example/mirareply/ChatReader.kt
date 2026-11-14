@@ -114,6 +114,8 @@ class ChatReader(private val prefs: Prefs) {
         if (timeRegex.matches(s)) return true
         // 既読表示やUIラベルなど
         if (s in UI_WORDS) return true
+        // ボイスの長さ表示（例: 19"）
+        if (s.matches(Regex("""^\d{1,3}["”″]$"""))) return true
         // 「入力中…」などの表示
         if (s.endsWith("入力中…") || s.endsWith("入力中...") || s.matches(Regex("""^[.・…]+$"""))) return true
         return false
