@@ -120,12 +120,12 @@ class Prefs(context: Context) {
 
     /** 100万トークンあたりの料金（ドル）「入力,出力」 */
     fun price(provider: String): Pair<Double, Double> {
-        val s = str("price_$provider", DEFAULT_PRICES[provider] ?: "0,0")
+        val s = str("price2_$provider", DEFAULT_PRICES[provider] ?: "0,0")
         val p = s.split(',', '/', ' ').mapNotNull { it.trim().toDoubleOrNull() }
         return (p.getOrNull(0) ?: 0.0) to (p.getOrNull(1) ?: 0.0)
     }
-    fun priceText(provider: String) = str("price_$provider", DEFAULT_PRICES[provider] ?: "0,0")
-    fun setPrice(provider: String, v: String) = putStr("price_$provider", v.trim())
+    fun priceText(provider: String) = str("price2_$provider", DEFAULT_PRICES[provider] ?: "0,0")
+    fun setPrice(provider: String, v: String) = putStr("price2_$provider", v.trim())
 
     // ---------- 端末内モデル ----------
 
@@ -201,7 +201,7 @@ class Prefs(context: Context) {
 
         /** 100万トークンあたりの目安料金（ドル）。設定で変更可 */
         val DEFAULT_PRICES = mapOf(
-            ENGINE_CLAUDE to "1,5",
+            ENGINE_CLAUDE to "0.1,0.5",   // Claude Haiku 5.5（10万トークン以下）
             ENGINE_OPENAI to "0.25,2",
             ENGINE_GEMINI to "0.3,2.5",
         )
