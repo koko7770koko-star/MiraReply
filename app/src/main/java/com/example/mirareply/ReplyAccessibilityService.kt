@@ -33,6 +33,8 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
     private lateinit var overlay: OverlayPanel
     private lateinit var llm: LlmReplyEngine
     private lateinit var api: ApiReplyEngine
+    private lateinit var store: CharStore
+    private lateinit var usage: UsageStore
 
     private val main = Handler(Looper.getMainLooper())
     // 生成は1本のスレッドで順番に動かす
@@ -55,6 +57,13 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
     // 自動会話
     private var autoTurns = 0
     private var autoErrors = 0
+    private var nudgesInRow = 0
+    private val idleRunnable = Runnable { onIdle() }
+
+    // 記憶・学習
+    private var currentMem: CharMemory? = null
+    /** アプリが送った文（口調の手本から除くため） */
+    private val appSent = LinkedHashSet<String>()
 
     private val scanRunnable = Runnable { scan(force = false) }
 
@@ -63,11 +72,14 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
         prefs = Prefs(this)
         reader = ChatReader(prefs)
         llm = LlmReplyEngine(applicationContext)
-        api = ApiReplyEngine(prefs)
+        usage = UsageStore(this)
+        api = ApiReplyEngine(prefs, usage)
+        store = CharStore(this)
         overlay = OverlayPanel(this, this)
         instance = this
         applyAutoUi()
         overlay.setStatus("待機中")
+        ModelDownloader.autoStartIfNeeded(this)
         prepareEngine()
     }
 
@@ -87,13 +99,15 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
             scan(force = false)
             return
         }
+        if (!prefs.modelReady()) {
+            ModelDownloader.autoStartIfNeeded(this)
+            overlay.setStatus(if (firstApiWithKey() != null) "端末AIのモデル準備中（それまでAPIで動作）" else "端末AIのモデルをダウンロード中…")
+            return
+        }
         scope.launch {
             overlay.setStatus("AIモデルを読み込み中…")
             try {
-                withContext(genDispatcher) {
-                    installBundledIfNeeded()
-                    llm.ensureLoaded(prefs.modelFile(), prefs.useGpu)
-                }
+                withContext(genDispatcher) { llm.ensureLoaded(prefs.modelFile(), prefs.useGpu) }
                 overlay.setStatus("準備OK（端末AI・${llm.backendName}）")
                 scan(force = false)
             } catch (t: Throwable) {
@@ -103,11 +117,35 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
         }
     }
 
-    /** APK 内蔵のモデルを初回だけ展開する（生成スレッドから呼ぶ） */
-    private fun installBundledIfNeeded() {
-        if (prefs.modelId != BundledModel.MODEL_ID || prefs.modelReady()) return
-        BundledModel.ensureInstalled(applicationContext) { done, total ->
-            main.post { overlay.setStatus("内蔵AIモデルを準備中… ${done * 100 / total}%（初回だけ）") }
+    /** 古い会話がたまったら記憶（要約）にまとめる。生成スレッドの空き時間に動かす */
+    private var summarizing = false
+    private fun maybeSummarize(mem: CharMemory) {
+        if (!prefs.memoryEnabled || summarizing) return
+        val end = mem.log.size - prefs.contextCount
+        if (end - mem.summarizedCount < SUMMARY_BATCH) return
+        val provider = if (usingApi) prefs.engine else firstApiWithKey()
+        if (provider == null && !llm.isReady) return
+        summarizing = true
+        // ログは画面読み取り（メインスレッド）で増えるので、ここで写しを取ってから渡す
+        val entries = mem.log.subList(mem.summarizedCount, end).toList().take(if (provider != null) 150 else 50)
+        val oldSummary = mem.summary
+        scope.launch {
+            try {
+                val text = withContext(genDispatcher) {
+                    if (provider != null) api.summarize(provider, mem.name, oldSummary, entries)
+                    else llm.complete(ReplyPrompt.summarySystem(mem.name), ReplyPrompt.summaryUser(mem.name, oldSummary, entries)).trim()
+                }
+                // メインスレッドに戻ってから反映
+                if (text.length > 20 && mem.summary == oldSummary) {
+                    mem.summary = text.take(1500)
+                    mem.summarizedCount = (mem.summarizedCount + entries.size).coerceAtMost(mem.log.size)
+                    store.save(mem)
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "summarize failed", t)
+            } finally {
+                summarizing = false
+            }
         }
     }
 
@@ -189,17 +227,45 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
                 return
             }
         }
-        if (!usingApi && !llm.isReady) { overlay.setStatus("AIモデル未読み込み"); return }
-
+        nudgesInRow = 0
+        main.removeCallbacks(idleRunnable)
         generate(key, buildRequest(screen))
     }
 
-    private fun buildRequest(screen: ChatScreen) = ReplyRequest(
-        history = screen.messages.takeLast(prefs.contextCount),
-        charName = screen.title,
-        style = prefs.styleHint,
-        userProfile = prefs.userProfile,
-    )
+    private fun buildRequest(screen: ChatScreen, nudge: Boolean = false): ReplyRequest {
+        var history = screen.messages.takeLast(prefs.contextCount)
+        var memory = ""
+        var examples = emptyList<String>()
+        var pickHint = ""
+        val mem = if (prefs.memoryEnabled || prefs.styleLearn) store.load(screen.title) else null
+        currentMem = mem
+        if (mem != null) {
+            store.merge(mem, screen.messages, appSent)
+            // ログの末尾が画面と一致していれば、画面外の分も含めてログから読ませる
+            val last = mem.log.lastOrNull()
+            if (last != null && CharStore.norm(last.text) == CharStore.norm(screen.messages.last().text)) {
+                history = mem.log.takeLast(prefs.contextCount).map { ChatMessage(it.text, it.fromUser, 0) }
+            }
+            if (prefs.memoryEnabled) memory = mem.summary
+            if (prefs.styleLearn) {
+                examples = store.styleExamples(mem, if (usingApi) 12 else 5)
+                pickHint = store.pickHint(mem)
+            }
+        }
+        return ReplyRequest(
+            history = history,
+            charName = screen.title,
+            style = prefs.styleHint,
+            userProfile = prefs.userProfile,
+            memory = memory,
+            styleExamples = examples,
+            pickHint = pickHint,
+            nudge = nudge,
+        )
+    }
+
+    private fun firstApiWithKey(): String? =
+        listOf(Prefs.ENGINE_CLAUDE, Prefs.ENGINE_OPENAI, Prefs.ENGINE_GEMINI).firstOrNull { prefs.apiKey(it).isNotBlank() }
 
     private fun generate(key: String, req: ReplyRequest) {
         cancelCountdown()
@@ -224,8 +290,10 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
                     onAutoError()
                 } else {
                     autoErrors = 0
-                    overlay.setStatus("候補（$used・${sec}秒）タップ=送信")
+                    val cost = if (used.startsWith("端末")) "" else "・\$${"%.4f".format(api.lastCostUsd)}／今月\$${"%.2f".format(usage.monthUsd())}"
+                    overlay.setStatus("候補（$used・${sec}秒$cost）")
                     if (prefs.autoSend) startCountdown(key)
+                    currentMem?.let { maybeSummarize(it) }
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -242,14 +310,19 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
 
     /** 選ばれたエンジンで生成。API失敗時は端末内モデルがあればそちらで作る */
     private fun runEngine(req: ReplyRequest): Pair<List<String>, String> {
-        if (!usingApi) return llm.generateReplies(req) to "端末AI"
+        if (!usingApi) {
+            if (!llm.isReady && prefs.modelReady()) llm.ensureLoaded(prefs.modelFile(), prefs.useGpu)
+            if (llm.isReady) return llm.generateReplies(req) to "端末AI"
+            // モデルがまだ無い間は、キーのあるAPIで代わりに作る
+            val alt = firstApiWithKey() ?: throw IllegalStateException("端末AIのモデルがまだありません（ダウンロード中なら完了をお待ちください）")
+            return api.generate(alt, req) to "${Prefs.ENGINE_LABELS[alt]!!.substringBefore(" ")}（モデル準備中のため）"
+        }
         return try {
             api.generate(prefs.engine, req) to engineLabel
         } catch (t: Throwable) {
             if (!prefs.localFallback) throw t
-            if (!prefs.modelReady() && !(prefs.modelId == BundledModel.MODEL_ID && BundledModel.isBundled(this))) throw t
+            if (!prefs.modelReady()) throw t
             Log.w(TAG, "api failed, fallback to local", t)
-            installBundledIfNeeded()
             llm.ensureLoaded(prefs.modelFile(), prefs.useGpu)
             llm.generateReplies(req) to "端末AI（API失敗のため）"
         }
@@ -259,12 +332,21 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
 
     private fun applyAutoUi() {
         if (!::overlay.isInitialized) return
+        AutoChatTileService.refresh(this)
         overlay.setAutoSend(prefs.autoSend, autoTurns, prefs.autoMaxTurns)
         overlay.setKeepScreenOn(prefs.autoSend && prefs.keepScreenOn)
     }
 
     private fun startCountdown(key: String) {
         cancelCountdown()
+        if (!prefs.inAutoHours()) {
+            // 時間外: 5分ごとに見直して、時間になったら送る
+            overlay.setStatus("時間外（${prefs.autoHours}時）なので自動送信は待機中。タップで送信可")
+            val r = Runnable { countdown = null; if (prefs.autoSend && candidates.isNotEmpty() && lastHandledKey == key) startCountdown(key) }
+            countdown = r
+            main.postDelayed(r, 5 * 60_000L)
+            return
+        }
         val min = prefs.autoSendDelaySec
         val max = prefs.autoSendDelayMaxSec
         var remain = if (max > min) Random.nextInt(min, max + 1) else min
@@ -292,7 +374,9 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
         // 待っている間にキャラが続けて話していたら、その内容で作り直す
         val screen = readScreen()
         val nowKey = screen?.messages?.lastOrNull { !it.fromUser }?.text
-        if (screen != null && nowKey != null && nowKey != key) {
+        if (key.startsWith(NUDGE_KEY)) {
+            if (screen != null && screen.messages.lastOrNull()?.fromUser == false) { lastHandledKey = null; scan(force = false); return }
+        } else if (screen != null && nowKey != null && nowKey != key) {
             lastHandledKey = null
             scan(force = false)
             return
@@ -315,6 +399,7 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
     private fun stopAuto(msg: String) {
         prefs.autoSend = false
         cancelCountdown()
+        main.removeCallbacks(idleRunnable)
         applyAutoUi()
         overlay.setStatus(msg)
         toast(msg)
@@ -349,6 +434,8 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
     }
 
     private fun sendText(text: String, auto: Boolean = false) {
+        appSent.add(CharStore.norm(text))
+        while (appSent.size > 300) appSent.remove(appSent.first())
         if (!putText(text)) { if (auto) stopAuto("入力できないので自動会話を止めました"); return }
         // 文字が入ると送信ボタンが出るアプリが多いので少し待ってから押す
         main.postDelayed({ clickSend(text, auto, attempt = 1) }, 400)
@@ -384,6 +471,10 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
                     stopAuto("自動会話 $autoTurns 回送ったので止めました")
                 } else {
                     overlay.setStatus("送信しました（自動 $autoTurns 回目）。返事待ち…")
+                    if (prefs.nudgeMin > 0) {
+                        main.removeCallbacks(idleRunnable)
+                        main.postDelayed(idleRunnable, prefs.nudgeMin * 60_000L)
+                    }
                 }
             } else {
                 overlay.setStatus("送信しました")
@@ -396,17 +487,38 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
     override fun onCandidateTapped(index: Int, text: String) {
         if (text.isBlank()) return
         cancelCountdown()
+        recordPick(index)
         sendText(text)
     }
 
     override fun onCandidateLongPressed(index: Int, text: String) {
         if (text.isBlank()) return
         cancelCountdown()
+        appSent.add(CharStore.norm(text)) // そのまま送られた時用（直して送れば自分の文として学習）
+        recordPick(index)
         if (putText(text)) {
             overlay.setPanelVisible(false)
             toast("入力欄に入れました。直して送信してください")
         }
     }
+
+    private fun recordPick(index: Int) {
+        val mem = currentMem ?: return
+        if (index in 0..2 && prefs.styleLearn) { mem.picks[index]++; store.save(mem) }
+    }
+
+    /** 自動会話中、キャラから返事が無いまま時間がたった時 */
+    private fun onIdle() {
+        if (!prefs.autoSend || prefs.nudgeMin <= 0 || nudgesInRow >= 1 || !prefs.inAutoHours()) return
+        val screen = readScreen() ?: return
+        if (screen.messages.lastOrNull()?.fromUser != true) return
+        nudgesInRow++
+        overlay.setStatus("返事が無いので、話しかける案を作ります")
+        generate(NUDGE_KEY + System.currentTimeMillis(), buildRequest(screen, nudge = true))
+    }
+
+    /** クイック設定タイルから */
+    fun toggleAutoFromOutside() { main.post { onToggleAutoSend() } }
 
     override fun onRegenerate() {
         cancelCountdown()
@@ -414,7 +526,6 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
         val req = if (screen != null && screen.messages.isNotEmpty()) buildRequest(screen) else lastRequest
         val key = req?.history?.lastOrNull { !it.fromUser }?.text
         if (req == null || key == null) { overlay.setStatus("キャラクターのメッセージが見つかりません"); return }
-        if (!usingApi && !llm.isReady) { overlay.setStatus("AIモデル未読み込み"); return }
         generate(key, req)
     }
 
@@ -428,6 +539,7 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
             if (candidates.isNotEmpty() && key != null) startCountdown(key) else scan(force = false)
         } else {
             cancelCountdown()
+            main.removeCallbacks(idleRunnable)
             overlay.setStatus("自動会話を止めました")
         }
         applyAutoUi()
@@ -477,6 +589,8 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
         private const val STABLE_MS = 1200L
         private const val MAX_AUTO_RETRY = 3
         private const val AUTO_RETRY_SEC = 8
+        private const val SUMMARY_BATCH = 40
+        private const val NUDGE_KEY = "\u0000nudge:"
         const val DUMP_FILE = "screen_dump.txt"
 
         @Volatile var instance: ReplyAccessibilityService? = null

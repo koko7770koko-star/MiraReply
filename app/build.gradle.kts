@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.mirareply"
         minSdk = 31          // Android 12 以上
         targetSdk = 36
-        versionCode = 3
-        versionName = "1.2"
+        versionCode = 4
+        versionName = "1.3"
         ndk { abiFilters += listOf("arm64-v8a") }
     }
 
@@ -41,10 +41,6 @@ android {
     }
     packaging {
         jniLibs { useLegacyPackaging = true }
-    }
-    // 内蔵モデル（assets/model/*.part*）は圧縮しない（圧縮しても縮まず、展開が遅くなるだけ）
-    androidResources {
-        noCompress += listOf("part00", "part01", "part02", "part03", "part04", "part05", "part06", "part07")
     }
 }
 

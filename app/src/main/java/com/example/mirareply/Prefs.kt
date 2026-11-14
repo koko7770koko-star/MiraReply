@@ -87,7 +87,52 @@ class Prefs(context: Context) {
         get() = sp.getBoolean("keepScreenOn", true)
         set(v) = sp.edit().putBoolean("keepScreenOn", v).apply()
 
+    /** 自動会話する時間帯（例: 8-23。空欄=いつでも） */
+    var autoHours: String
+        get() = str("autoHours", "")
+        set(v) = putStr("autoHours", v.trim())
+
+    /** 今が自動会話してよい時間帯か */
+    fun inAutoHours(hour: Int = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)): Boolean {
+        val m = Regex("""^(\d{1,2})\s*[-〜~]\s*(\d{1,2})$""").find(autoHours) ?: return true
+        val a = m.groupValues[1].toInt() % 24; val b = m.groupValues[2].toInt()
+        return if (a < b) hour in a until b else hour >= a || hour < b % 24
+    }
+
+    /** キャラから返事が無い時、何分後に自分から話しかけるか（0=しない） */
+    var nudgeMin: Int
+        get() = sp.getInt("nudgeMin", 0)
+        set(v) = sp.edit().putInt("nudgeMin", v.coerceIn(0, 1440)).apply()
+
+    // ---------- 記憶・学習 ----------
+
+    /** キャラ別に会話を記録し、古い会話を要約して覚えておく */
+    var memoryEnabled: Boolean
+        get() = sp.getBoolean("memoryEnabled", true)
+        set(v) = sp.edit().putBoolean("memoryEnabled", v).apply()
+
+    /** 自分が送った文を手本にして、候補の口調を自分に寄せる */
+    var styleLearn: Boolean
+        get() = sp.getBoolean("styleLearn", true)
+        set(v) = sp.edit().putBoolean("styleLearn", v).apply()
+
+    // ---------- API料金 ----------
+
+    /** 100万トークンあたりの料金（ドル）「入力,出力」 */
+    fun price(provider: String): Pair<Double, Double> {
+        val s = str("price_$provider", DEFAULT_PRICES[provider] ?: "0,0")
+        val p = s.split(',', '/', ' ').mapNotNull { it.trim().toDoubleOrNull() }
+        return (p.getOrNull(0) ?: 0.0) to (p.getOrNull(1) ?: 0.0)
+    }
+    fun priceText(provider: String) = str("price_$provider", DEFAULT_PRICES[provider] ?: "0,0")
+    fun setPrice(provider: String, v: String) = putStr("price_$provider", v.trim())
+
     // ---------- 端末内モデル ----------
+
+    /** モデルが無い時、Wi-Fi接続中なら自動でダウンロードする */
+    var autoModelDownload: Boolean
+        get() = sp.getBoolean("autoModelDownload", true)
+        set(v) = sp.edit().putBoolean("autoModelDownload", v).apply()
 
     /** GPUを使う（失敗したら自動でCPUに切り替え） */
     var useGpu: Boolean
@@ -152,6 +197,13 @@ class Prefs(context: Context) {
             ENGINE_CLAUDE to "claude-haiku-5-5",
             ENGINE_OPENAI to "gpt-5-mini",
             ENGINE_GEMINI to "gemini-2.5-flash",
+        )
+
+        /** 100万トークンあたりの目安料金（ドル）。設定で変更可 */
+        val DEFAULT_PRICES = mapOf(
+            ENGINE_CLAUDE to "1,5",
+            ENGINE_OPENAI to "0.25,2",
+            ENGINE_GEMINI to "0.3,2.5",
         )
 
         val MODELS = listOf(

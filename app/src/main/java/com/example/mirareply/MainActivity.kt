@@ -54,6 +54,17 @@ class MainActivity : Activity() {
     private lateinit var sendIdEt: EditText
     private lateinit var listIdEt: EditText
 
+    private lateinit var hoursEt: EditText
+    private lateinit var nudgeEt: EditText
+    private lateinit var memorySw: Switch
+    private lateinit var styleSw: Switch
+    private lateinit var autoDlSw: Switch
+    private val priceEts = HashMap<String, EditText>()
+    private lateinit var usageText: TextView
+    private lateinit var charsBox: LinearLayout
+    private lateinit var store: CharStore
+    private lateinit var usage: UsageStore
+
     private var downloadId = -1L
     private var copying = false
 
@@ -62,7 +73,9 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = Prefs(this)
-        downloadId = getSharedPreferences("dl", MODE_PRIVATE).getLong("id", -1L)
+        store = CharStore(this)
+        usage = UsageStore(this)
+        downloadId = ModelDownloader.currentId(this)
 
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -108,8 +121,10 @@ class MainActivity : Activity() {
         col.addView(modelGroup)
         modelStatus = note("")
         col.addView(modelStatus)
-        col.addView(note("Gemma 4 E2B はアプリに内蔵済み。初回に自動で準備するのでダウンロード不要。"))
-        col.addView(button("モデルをダウンロード（Gemma 3 1B など内蔵以外の時）") { startDownload() })
+        col.addView(note("Wi-Fi につながっていれば、初回に自動でダウンロードします（約2.6GB）。終わるまではAPIキーがあればAPIで動きます。"))
+        autoDlSw = Switch(this).apply { text = "Wi-Fi接続時にモデルを自動ダウンロード"; isChecked = prefs.autoModelDownload }
+        col.addView(autoDlSw)
+        col.addView(button("今すぐダウンロード（モバイル回線でも）") { startDownload() })
         col.addView(button("ダウンロード済みのファイルを選ぶ（.litertlm）") { pickFile() })
 
         // ② ユーザー補助
@@ -145,6 +160,29 @@ class MainActivity : Activity() {
         col.addView(randomPickSw)
         screenOnSw = Switch(this).apply { text = "自動会話中は画面を消さない"; isChecked = prefs.keepScreenOn }
         col.addView(screenOnSw)
+        hoursEt = field(col, "自動会話する時間帯（例: 8-23。空欄=いつでも）", prefs.autoHours)
+        nudgeEt = field(col, "返事が無い時、何分後に自分から話しかけるか（0=しない）", prefs.nudgeMin.toString(), number = true)
+        col.addView(note("通知を下ろしたクイック設定に「自動会話」タイルを追加すると、そこからもオン/オフできます（パネルの鉛筆マーク → タイルを追加）。"))
+
+        // ⑤ 記憶と学習
+        col.addView(header("⑤ 記憶と口調の学習"))
+        memorySw = Switch(this).apply { text = "キャラ別に会話を記録して覚えておく"; isChecked = prefs.memoryEnabled }
+        col.addView(memorySw)
+        styleSw = Switch(this).apply { text = "自分の書き方を学習して候補を寄せる"; isChecked = prefs.styleLearn }
+        col.addView(styleSw)
+        col.addView(note("会話はこのスマホの中に保存されます。古い会話は${40}件たまるごとにAIが要約して「記憶」にします（APIか端末AIを使用）。記憶は下で直せます。"))
+        charsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        col.addView(charsBox)
+
+        // ⑥ API料金
+        col.addView(header("⑥ APIの使用量と料金"))
+        usageText = note("")
+        col.addView(usageText)
+        col.addView(note("料金の目安（100万トークンあたりのドル「入力,出力」）。使うモデルに合わせて直せます。"))
+        for (e in listOf(Prefs.ENGINE_CLAUDE, Prefs.ENGINE_OPENAI, Prefs.ENGINE_GEMINI)) {
+            priceEts[e] = field(col, Prefs.ENGINE_LABELS[e]!!.substringBefore("（"), prefs.priceText(e))
+        }
+        col.addView(button("今月の使用量をリセット") { usage.resetMonth(); refreshUsage() })
 
         col.addView(header("詳細設定（うまく読み取れない時だけ）", 15f))
         pkgEt = field(col, "対象アプリのパッケージ名", prefs.targetPackage)
@@ -161,34 +199,44 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         refresh()
+        if (ModelDownloader.autoStartIfNeeded(this)) downloadId = ModelDownloader.currentId(this)
         pollDownload()
-        installBundled()
+        refreshChars()
+        refreshUsage()
     }
 
-    /** APK 内蔵モデルを展開（初回だけ。数十秒〜数分） */
-    private fun installBundled() {
-        if (copying || prefs.modelId != BundledModel.MODEL_ID || prefs.modelReady()) return
-        if (!BundledModel.isBundled(this)) return
-        copying = true
-        modelStatus.text = "内蔵モデルを準備中…"
-        Thread {
-            try {
-                BundledModel.ensureInstalled(applicationContext) { done, total ->
-                    runOnUiThread { modelStatus.text = "内蔵モデルを準備中… ${done * 100 / total}%（初回だけ）" }
-                }
-                runOnUiThread {
-                    copying = false; refresh()
-                    ReplyAccessibilityService.instance?.reloadSettings(reloadModel = true)
-                }
-            } catch (t: Throwable) {
-                runOnUiThread { copying = false; modelStatus.text = t.message ?: "内蔵モデルの準備に失敗" }
+    private fun refreshUsage() { usageText.text = usage.report() }
+
+    /** キャラ一覧（記憶の編集・ログ共有・削除） */
+    private fun refreshChars() {
+        charsBox.removeAllViews()
+        val list = store.list()
+        if (list.isEmpty()) { charsBox.addView(note("まだ記録はありません")); return }
+        for (m in list) {
+            charsBox.addView(header("${m.name.ifBlank { "（名前不明）" }}　ログ${m.log.size}件", 15f))
+            val et = field(charsBox, "記憶（AIに渡す要約。自由に書き換え可）", m.summary, multi = true)
+            val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            fun small(t: String, f: () -> Unit) = Button(this).apply {
+                text = t; isAllCaps = false; setOnClickListener { f() }
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             }
-        }.start()
-    }
-
-    override fun onPause() {
-        super.onPause()
-        main.removeCallbacksAndMessages(null)
+            row.addView(small("記憶を保存") {
+                val mem = store.load(m.name); mem.summary = et.text.toString().trim(); store.save(mem); toast("保存しました")
+            })
+            row.addView(small("ログ共有") {
+                val text = store.exportText(store.load(m.name)).takeLast(150_000)
+                startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
+                    type = "text/plain"; putExtra(Intent.EXTRA_SUBJECT, "${m.name} 会話ログ"); putExtra(Intent.EXTRA_TEXT, text)
+                }, "会話ログを共有"))
+            })
+            row.addView(small("削除") {
+                android.app.AlertDialog.Builder(this)
+                    .setMessage("「${m.name.ifBlank { "名前不明" }}」の会話ログと記憶を消します。元に戻せません。")
+                    .setPositiveButton("消す") { _, _ -> store.delete(m.name); refreshChars() }
+                    .setNegativeButton("やめる", null).show()
+            })
+            charsBox.addView(row)
+        }
     }
 
     private fun refresh() {
@@ -200,7 +248,7 @@ class MainActivity : Activity() {
             val m = prefs.model
             modelStatus.text = when {
                 f.exists() && f.length() >= m.sizeBytes * 0.98 ->
-                    "モデル：準備済み ✅（${mb(f.length())}${if (m.id == BundledModel.MODEL_ID && BundledModel.isBundled(this)) "・アプリに内蔵" else ""}）"
+                    "モデル：準備済み ✅（${mb(f.length())}）"
                 f.exists() -> "モデル：途中（${mb(f.length())} / ${mb(m.sizeBytes)}）"
                 else -> "モデル：未ダウンロード"
             }
@@ -223,16 +271,8 @@ class MainActivity : Activity() {
             startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(m.pageUrl)))
             return
         }
-        val f = prefs.modelFile()
-        if (f.exists()) f.delete()
-        val req = DownloadManager.Request(Uri.parse(m.url))
-            .setTitle("AIモデル ${m.fileName}")
-            .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-            .setDestinationInExternalFilesDir(this, null, m.fileName)
-            .setAllowedOverMetered(true)
-        val dm = getSystemService(DOWNLOAD_SERVICE) as DownloadManager
-        downloadId = dm.enqueue(req)
-        getSharedPreferences("dl", MODE_PRIVATE).edit().putLong("id", downloadId).apply()
+        ModelDownloader.start(this)
+        downloadId = ModelDownloader.currentId(this)
         toast("ダウンロードを開始しました")
         pollDownload()
     }
@@ -248,7 +288,7 @@ class MainActivity : Activity() {
             when (status) {
                 DownloadManager.STATUS_SUCCESSFUL -> {
                     downloadId = -1
-                    getSharedPreferences("dl", MODE_PRIVATE).edit().remove("id").apply()
+                    ModelDownloader.clear(this)
                     refresh()
                     ReplyAccessibilityService.instance?.reloadSettings(reloadModel = true)
                     return
@@ -335,6 +375,14 @@ class MainActivity : Activity() {
         prefs.autoPickRandom = randomPickSw.isChecked
         prefs.keepScreenOn = screenOnSw.isChecked
         prefs.ignoreTexts = ignoreEt.text.toString()
+        prefs.autoHours = hoursEt.text.toString()
+        prefs.nudgeMin = nudgeEt.text.toString().toIntOrNull() ?: 0
+        prefs.memoryEnabled = memorySw.isChecked
+        prefs.styleLearn = styleSw.isChecked
+        prefs.autoModelDownload = autoDlSw.isChecked
+        for ((e, et) in priceEts) prefs.setPrice(e, et.text.toString())
+        AutoChatTileService.refresh(this)
+        refreshUsage()
         prefs.useGpu = gpuSw.isChecked
         prefs.targetPackage = pkgEt.text.toString().ifBlank { Prefs.DEFAULT_PACKAGE }
         prefs.listViewId = listIdEt.text.toString()

@@ -3,6 +3,7 @@
 
     <!-- モデルファイル(約2.6GB)の初回ダウンロードだけに使う。返信生成では通信しない -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <application
         android:allowBackup="false"
@@ -36,6 +37,17 @@
             <meta-data
                 android:name="android.accessibilityservice"
                 android:resource="@xml/accessibility_service_config" />
+        </service>
+
+        <service
+            android:name=".AutoChatTileService"
+            android:exported="true"
+            android:icon="@android:drawable/ic_menu_send"
+            android:label="自動会話"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
         </service>
     </application>
 </manifest>

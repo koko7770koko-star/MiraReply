@@ -60,6 +60,13 @@ class LlmReplyEngine(private val context: Context) {
         throw IllegalStateException("モデルを読み込めませんでした: ${lastError?.message}", lastError)
     }
 
+    /** 汎用: system と user を渡して文章を作る（記憶の要約などに使う） */
+    @Synchronized
+    fun complete(system: String, user: String): String {
+        val e = engine ?: throw IllegalStateException("モデルが読み込まれていません")
+        return createConversation(e, system).use { it.sendMessage(user).toString() }
+    }
+
     /** 会話履歴から返信候補を3つ作る */
     @Synchronized
     fun generateReplies(req: ReplyRequest): List<String> {

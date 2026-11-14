@@ -9,6 +9,10 @@ data class ReplyRequest(
     val charName: String,             // 相手キャラ名（不明なら空）
     val style: String,                // 返信の雰囲気
     val userProfile: String,          // 自分の呼び名・設定
+    val memory: String = "",          // 古い会話の要約（記憶）
+    val styleExamples: List<String> = emptyList(), // 自分が過去に送った文（口調の手本）
+    val pickHint: String = "",        // よく選ぶ候補の傾向
+    val nudge: Boolean = false,       // true: 返事が来ないので自分から話しかける
 )
 
 object ReplyPrompt {
@@ -16,11 +20,21 @@ object ReplyPrompt {
     fun system(req: ReplyRequest, json: Boolean): String = buildString {
         val who = req.charName.ifBlank { "AIキャラクター" }
         appendLine("あなたはチャットの返信を考えるアシスタント。")
-        appendLine("ユーザーは「$who」と1対1で会話中。$who の最新メッセージに対し、ユーザーが次に送る返信の候補を3つ作る。")
+        if (req.nudge) {
+            appendLine("ユーザーは「$who」と1対1で会話中。しばらく$who から返事が無く会話が止まっている。ユーザーから自然に話しかけるメッセージの候補を3つ作る。")
+        } else {
+            appendLine("ユーザーは「$who」と1対1で会話中。$who の最新メッセージに対し、ユーザーが次に送る返信の候補を3つ作る。")
+        }
         appendLine()
         appendLine("ルール:")
-        appendLine("- 3つは方向性を変える: 1=気持ちに寄り添うリアクション / 2=質問や提案で話を広げる / 3=遊び心・冗談・ちょっと意外な返し。")
-        appendLine("- 最新メッセージの具体的な内容（言葉・出来事・問いかけ）に必ず触れる。質問されていたら答える。")
+        if (req.nudge) {
+            appendLine("- 3つは方向性を変える: 1=さっきの話の続き・気づかい / 2=自分の近況や新しい話題 / 3=質問や遊びの誘い。")
+            appendLine("- 催促や責める言い方（「無視？」「返事して」等）はしない。")
+        } else {
+            appendLine("- 3つは方向性を変える: 1=気持ちに寄り添うリアクション / 2=質問や提案で話を広げる / 3=遊び心・冗談・ちょっと意外な返し。")
+            appendLine("- 最新メッセージの具体的な内容（言葉・出来事・問いかけ）に必ず触れる。質問されていたら答える。")
+        }
+        appendLine("- 記憶にある名前・呼び方・約束・好みなどと矛盾しない。自然な時は記憶の内容に触れてよい。")
         appendLine("- ユーザー本人の発言だけを書く。$who のセリフ、ト書き、（）内の動作説明、解説は書かない。")
         appendLine("- これまでのユーザーの口調・一人称・呼び方に合わせる。")
         appendLine("- ユーザーの過去の発言と同じ言い回しや、毎回同じ始まり方（「そうなんだ」「いいね」等）を繰り返さない。")
@@ -33,6 +47,17 @@ object ReplyPrompt {
         if (req.userProfile.isNotBlank()) {
             appendLine("ユーザー自身の設定: ${req.userProfile.trim()}")
         }
+        if (req.memory.isNotBlank()) {
+            appendLine()
+            appendLine("【$who との これまでの記憶（古い会話の要約）】")
+            appendLine(req.memory.trim())
+        }
+        if (req.styleExamples.isNotEmpty()) {
+            appendLine()
+            appendLine("【ユーザーが普段送っている文の例】（一人称・語尾・長さ・絵文字や「w」の使い方などの書き癖を真似る。内容はコピーしない）")
+            req.styleExamples.forEach { appendLine("- ${it.replace('\n', ' ').take(120)}") }
+        }
+        if (req.pickHint.isNotBlank()) appendLine(req.pickHint)
         appendLine()
         if (json) {
             appendLine("出力は次のJSONだけ。前置き・コードブロック・解説は不要。")
@@ -53,10 +78,34 @@ object ReplyPrompt {
             appendLine("$name: ${m.text.replace('\n', ' ')}")
         }
         appendLine()
-        appendLine("【$who の最新メッセージ】")
-        appendLine(req.history.lastOrNull { !it.fromUser }?.text ?: "")
+        if (req.nudge) {
+            append("ユーザーから話しかけるメッセージ候補を3つ:")
+        } else {
+            appendLine("【$who の最新メッセージ】")
+            appendLine(req.history.lastOrNull { !it.fromUser }?.text ?: "")
+            appendLine()
+            append("ユーザーの返信候補を3つ:")
+        }
+    }
+
+    // ---------- 記憶（要約） ----------
+
+    fun summarySystem(charName: String) = buildString {
+        val who = charName.ifBlank { "キャラ" }
+        appendLine("あなたはユーザーと「$who」のチャットの記憶係。今までの記憶と新しい会話を合わせ、今後の会話で役立つ記憶を書き直す。")
+        appendLine("残すもの: 互いの呼び方・名前、ユーザーについて分かったこと（好み・予定・出来事）、$who の設定や言ったこと、約束、二人の関係の変化、続いている話題。")
+        appendLine("あいさつや一時的な雑談は捨てる。箇条書き（「- 」で始める）で、全体で600字以内。前置き不要。")
+    }
+
+    fun summaryUser(charName: String, oldSummary: String, entries: List<LogEntry>) = buildString {
+        val who = charName.ifBlank { "キャラ" }
+        appendLine("【今までの記憶】")
+        appendLine(oldSummary.ifBlank { "（まだ無し）" })
         appendLine()
-        append("ユーザーの返信候補を3つ:")
+        appendLine("【新しい会話】")
+        for (e in entries) appendLine((if (e.fromUser) "ユーザー" else who) + ": " + e.text.replace('\n', ' '))
+        appendLine()
+        append("書き直した記憶:")
     }
 
     // ---------- 出力の解析 ----------
