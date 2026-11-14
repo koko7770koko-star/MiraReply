@@ -156,8 +156,8 @@ class Prefs(context: Context) {
 
     /** うまく送れた送信方法（次から最初に試す） */
     var sendMethod: Int
-        get() = sp.getInt("sendMethod", 0)
-        set(v) = sp.edit().putInt("sendMethod", v).apply()
+        get() = sp.getInt("sendMethod2", 3)
+        set(v) = sp.edit().putInt("sendMethod2", v).apply()
 
     // ---------- 読み取りの手動指定 ----------
 

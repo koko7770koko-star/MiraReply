@@ -172,12 +172,15 @@ class ChatReader(private val prefs: Prefs) {
         }
         if (input != null) {
             val inRect = Rect(); input.getBoundsInScreen(inRect)
+            // 送信以外のボタン（ヒント・括弧・絵文字・音声・＋など）は除く
+            val notSend = Regex("tips|bracket|emoji|emo|face|sticker|voice|mic|audio|record|more|plus|add|photo|image|pic|camera|gift|keyboard|switch|back|close|menu|setting")
             // 入力欄と同じ行で、入力欄の右側（または右端寄り）にある小さめの部品
             val row = ArrayList<Pair<Int, AccessibilityNodeInfo>>()
             walk(root) { n ->
                 if (!n.isVisibleToUser || n.isEditable) return@walk
                 val r = Rect(); n.getBoundsInScreen(r)
                 if (r.isEmpty || r.width() > inRect.width() / 2 || r.height() > inRect.height() * 3) return@walk
+                if (notSend.containsMatchIn(n.viewIdResourceName?.substringAfter("/")?.lowercase().orEmpty())) return@walk
                 val sameRow = r.centerY() in (inRect.top - 40)..(inRect.bottom + 40)
                 if (sameRow && r.centerX() > inRect.centerX() + inRect.width() / 4) {
                     row.add((kotlin.math.abs(r.left - inRect.right) - if (n.isClickable) 50 else 0) to n)

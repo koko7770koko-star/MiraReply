@@ -337,6 +337,8 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
         return try {
             api.generate(prefs.engine, req) to engineLabel
         } catch (t: Throwable) {
+            DebugLog.d("API失敗: ${t.message}")
+            main.post { toast("API失敗: ${t.message?.take(80)}") }
             if (!prefs.localFallback) throw t
             if (!prefs.modelReady()) throw t
             Log.w(TAG, "api failed, fallback to local", t)
@@ -511,17 +513,27 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
         DebugLog.d("送信: 方法${method}（${SEND_METHODS[method]}）実行=$ok 候補${cands.size}個" +
             (cands.firstOrNull()?.let { " 1番目=${it.viewIdResourceName ?: it.className} desc=${it.contentDescription}" } ?: ""))
         if (!ok) { clickSend(text, auto, attempt + 1); return }
+        checkSent(text, auto, method, attempt, check = 0)
+    }
+
+    /** 送れたか確認。入力欄が空でも画面に出るまで少し待つ（二重送信を防ぐ） */
+    private fun checkSent(text: String, auto: Boolean, method: Int, attempt: Int, check: Int) {
         main.postDelayed({
-            if (isSent(text)) {
-                if (prefs.sendMethod != method) { prefs.sendMethod = method; DebugLog.d("送信方法${method}を記憶") }
-                onSent(auto)
-            } else {
-                // 文字が消えてしまっていたら入れ直してから次の方法へ
-                val cur = rootInActiveWindow?.let { reader.findInput(it)?.text?.toString() }.orEmpty()
-                if (cur.isBlank()) putText(text)
-                clickSend(text, auto, attempt + 1)
+            val st = sendState(text)
+            DebugLog.d("送信確認: 方法$method $st")
+            when {
+                st == "sent" -> {
+                    if (prefs.sendMethod != method) { prefs.sendMethod = method; DebugLog.d("送信方法${method}を記憶") }
+                    onSent(auto)
+                }
+                st == "cleared" && check < 3 -> checkSent(text, auto, method, attempt, check + 1)
+                else -> {
+                    // 入力欄が変わってしまっていたら入れ直してから次の方法へ
+                    if (st != "same") putText(text)
+                    clickSend(text, auto, attempt + 1)
+                }
             }
-        }, 900)
+        }, 1000)
     }
 
     private fun trySend(method: Int, root: AccessibilityNodeInfo, input: AccessibilityNodeInfo?, cands: List<AccessibilityNodeInfo>, text: String): Boolean {
@@ -568,14 +580,23 @@ class ReplyAccessibilityService : AccessibilityService(), OverlayPanel.Listener 
         }
     }
 
-    /** 送れたか（入力欄から文が消えた／最後の発言が自分のその文） */
-    private fun isSent(text: String): Boolean {
-        val root = rootInActiveWindow ?: return false
-        val inputText = reader.findInput(root)?.text?.toString().orEmpty()
-        if (CharStore.norm(inputText) != CharStore.norm(text)) return true
-        val screen = readScreen() ?: return false
-        val last = screen.messages.lastOrNull() ?: return false
-        return last.fromUser && CharStore.norm(last.text) == CharStore.norm(text) && inputText.isBlank()
+    /**
+     * sent=画面の最後に自分のその発言が出た / same=入力欄にまだ同じ文 /
+     * cleared=入力欄は空だが画面にまだ出ない / changed=入力欄の文が変わった
+     */
+    private fun sendState(text: String): String {
+        val screen = readScreen() ?: return "same"
+        val t = CharStore.norm(text)
+        val lastMine = screen.messages.lastOrNull()?.takeIf { it.fromUser }?.let { CharStore.norm(it.text) }
+        if (lastMine != null && (lastMine == t || lastMine.startsWith(t.take(15)) || t.startsWith(lastMine.take(15)))) return "sent"
+        val input = rootInActiveWindow?.let { reader.findInput(it) }
+        val cur = CharStore.norm(input?.text?.toString().orEmpty())
+        val hint = CharStore.norm(input?.hintText?.toString().orEmpty())
+        return when {
+            cur == t -> "same"
+            cur.isEmpty() || cur == hint -> "cleared"
+            else -> "changed"
+        }
     }
 
     private fun onSent(auto: Boolean) {
